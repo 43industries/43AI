@@ -1,0 +1,976 @@
+"""
+Personal AI Assistant - Full Jarvis-like System
+Complete with voice, vision, web search, task management, and personal context
+"""
+
+import os
+import json
+import base64
+from pathlib import Path
+from typing import List, Dict, Optional
+from datetime import datetime
+import anthropic
+
+# You'll need: pip install anthropic chromadb pypdf sentence-transformers 
+# speechrecognition pyttsx3 pillow pyaudio requests beautifulsoup4 ebooklib
+
+try:
+    import PyPDF2
+    import speech_recognition as sr
+    import pyttsx3
+    from PIL import Image
+    import io
+    import requests
+    from bs4 import BeautifulSoup
+    import re
+    import zipfile
+    try:
+        import ebooklib
+        from ebooklib import epub
+        EPUB_AVAILABLE = True
+    except ImportError:
+        EPUB_AVAILABLE = False
+except ImportError as e:
+    print("Installing required packages...")
+    print("Run: pip install anthropic pypdf2 sentence-transformers speechrecognition pyttsx3 pillow pyaudio requests beautifulsoup4 ebooklib")
+    print(f"Missing: {e}")
+    exit()
+
+# ChromaDB is optional - graceful fallback
+try:
+    import chromadb
+    from chromadb.utils import embedding_functions
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
+    print("Note: chromadb not available - knowledge base vector search disabled")
+    print("Books can still be downloaded and stored, but semantic search won't work")
+
+
+class TaskManager:
+    """Manages tasks and projects"""
+    def __init__(self, storage_path: Path):
+        self.storage_path = storage_path / "tasks.json"
+        self.tasks = self._load_tasks()
+    
+    def _load_tasks(self) -> Dict:
+        if self.storage_path.exists():
+            with open(self.storage_path, 'r') as f:
+                return json.load(f)
+        return {"tasks": [], "projects": []}
+    
+    def _save_tasks(self):
+        with open(self.storage_path, 'w') as f:
+            json.dump(self.tasks, f, indent=2)
+    
+    def add_task(self, title: str, project: str = "general", priority: str = "medium"):
+        task = {
+            "id": len(self.tasks["tasks"]) + 1,
+            "title": title,
+            "project": project,
+            "priority": priority,
+            "status": "pending",
+            "created": datetime.now().isoformat()
+        }
+        self.tasks["tasks"].append(task)
+        self._save_tasks()
+        return f"✓ Added task: {title}"
+    
+    def complete_task(self, task_id: int):
+        for task in self.tasks["tasks"]:
+            if task["id"] == task_id:
+                task["status"] = "completed"
+                task["completed"] = datetime.now().isoformat()
+                self._save_tasks()
+                return f"✓ Completed: {task['title']}"
+        return "Task not found"
+    
+    def list_tasks(self, status: str = "pending") -> str:
+        filtered = [t for t in self.tasks["tasks"] if t["status"] == status]
+        if not filtered:
+            return f"No {status} tasks"
+        
+        result = f"\n{status.upper()} TASKS:\n"
+        for task in filtered:
+            result += f"[{task['id']}] {task['title']} ({task['priority']}) - {task['project']}\n"
+        return result
+    
+    def get_context(self) -> str:
+        """Get task context for AI"""
+        pending = [t for t in self.tasks["tasks"] if t["status"] == "pending"]
+        if not pending:
+            return "No pending tasks."
+        
+        context = "Current pending tasks:\n"
+        for task in pending[:5]:  # Top 5 tasks
+            context += f"- {task['title']} ({task['project']})\n"
+        return context
+
+
+class PersonalContext:
+    """Stores and manages personal preferences and context"""
+    def __init__(self, storage_path: Path):
+        self.storage_path = storage_path / "personal_context.json"
+        self.context = self._load_context()
+    
+    def _load_context(self) -> Dict:
+        if self.storage_path.exists():
+            with open(self.storage_path, 'r') as f:
+                return json.load(f)
+        return {
+            "preferences": {},
+            "goals": [],
+            "interests": [],
+            "thinking_patterns": [],
+            "important_facts": []
+        }
+    
+    def _save_context(self):
+        with open(self.storage_path, 'w') as f:
+            json.dump(self.context, f, indent=2)
+    
+    def add_preference(self, key: str, value: str):
+        self.context["preferences"][key] = value
+        self._save_context()
+        return f"✓ Saved preference: {key} = {value}"
+    
+    def add_goal(self, goal: str):
+        self.context["goals"].append({
+            "goal": goal,
+            "added": datetime.now().isoformat()
+        })
+        self._save_context()
+        return f"✓ Added goal: {goal}"
+    
+    def add_interest(self, interest: str):
+        if interest not in self.context["interests"]:
+            self.context["interests"].append(interest)
+            self._save_context()
+        return f"✓ Added interest: {interest}"
+    
+    def learn_pattern(self, pattern: str):
+        """Learn from user's thinking patterns"""
+        self.context["thinking_patterns"].append({
+            "pattern": pattern,
+            "observed": datetime.now().isoformat()
+        })
+        self._save_context()
+    
+    def get_context_summary(self) -> str:
+        """Get personal context for AI"""
+        summary = "=== PERSONAL CONTEXT ===\n"
+        
+        if self.context["preferences"]:
+            summary += "Preferences:\n"
+            for k, v in self.context["preferences"].items():
+                summary += f"- {k}: {v}\n"
+        
+        if self.context["goals"]:
+            summary += "\nCurrent Goals:\n"
+            for goal in self.context["goals"][-5:]:
+                summary += f"- {goal['goal']}\n"
+        
+        if self.context["interests"]:
+            summary += f"\nInterests: {', '.join(self.context['interests'][:10])}\n"
+        
+        return summary
+
+
+class VoiceInterface:
+    """Handles voice input and output"""
+    def __init__(self):
+        self.recognizer = sr.Recognizer()
+        self.engine = pyttsx3.init()
+        self.engine.setProperty('rate', 175)  # Speed
+        self.enabled = True
+    
+    def listen(self) -> Optional[str]:
+        """Listen for voice input"""
+        if not self.enabled:
+            return None
+        
+        try:
+            with sr.Microphone() as source:
+                print("🎤 Listening...")
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
+                
+            text = self.recognizer.recognize_google(audio)
+            print(f"You said: {text}")
+            return text
+        except sr.WaitTimeoutError:
+            return None
+        except sr.UnknownValueError:
+            self.speak("I didn't catch that. Could you repeat?")
+            return None
+        except Exception as e:
+            print(f"Voice error: {e}")
+            return None
+    
+    def speak(self, text: str):
+        """Convert text to speech"""
+        if not self.enabled:
+            return
+        
+        try:
+            self.engine.say(text)
+            self.engine.runAndWait()
+        except Exception as e:
+            print(f"Speech error: {e}")
+    
+    def toggle(self):
+        """Toggle voice on/off"""
+        self.enabled = not self.enabled
+        status = "enabled" if self.enabled else "disabled"
+        print(f"Voice {status}")
+        return status
+
+
+class WebSearch:
+    """Web search and fetch capabilities"""
+    def __init__(self):
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+    
+    def search(self, query: str, num_results: int = 3) -> List[Dict]:
+        """Simple web search using DuckDuckGo"""
+        try:
+            url = f"https://html.duckduckgo.com/html/?q={query}"
+            response = requests.get(url, headers=self.headers, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            results = []
+            for result in soup.find_all('div', class_='result')[:num_results]:
+                title_elem = result.find('a', class_='result__a')
+                snippet_elem = result.find('a', class_='result__snippet')
+                
+                if title_elem:
+                    results.append({
+                        'title': title_elem.get_text(),
+                        'url': title_elem.get('href', ''),
+                        'snippet': snippet_elem.get_text() if snippet_elem else ''
+                    })
+            
+            return results
+        except Exception as e:
+            print(f"Search error: {e}")
+            return []
+    
+    def fetch_page(self, url: str) -> str:
+        """Fetch and extract text from a webpage"""
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+            
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = ' '.join(chunk for chunk in chunks if chunk)
+            
+            return text[:5000]  # Limit length
+        except Exception as e:
+            print(f"Fetch error: {e}")
+            return ""
+
+
+class BookReader:
+    """Reads and downloads books from the internet"""
+    def __init__(self):
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+    
+    def search_gutenberg(self, query: str, max_results: int = 5) -> List[Dict]:
+        """Search Project Gutenberg for books"""
+        try:
+            # Project Gutenberg search API
+            search_url = f"https://www.gutenberg.org/ebooks/search/?query={query}&submit_search=Go%21"
+            response = requests.get(search_url, headers=self.headers, timeout=15)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            results = []
+            book_links = soup.find_all('li', class_='booklink')
+            
+            for book in book_links[:max_results]:
+                title_elem = book.find('span', class_='title')
+                author_elem = book.find('span', class_='subtitle')
+                
+                if title_elem:
+                    link = book.find('a')
+                    book_id = None
+                    if link and link.get('href'):
+                        # Extract book ID from URL like /ebooks/12345
+                        match = re.search(r'/ebooks/(\d+)', link.get('href'))
+                        if match:
+                            book_id = match.group(1)
+                    
+                    results.append({
+                        'title': title_elem.get_text().strip(),
+                        'author': author_elem.get_text().strip() if author_elem else 'Unknown',
+                        'gutenberg_id': book_id,
+                        'source': 'gutenberg'
+                    })
+            
+            return results
+        except Exception as e:
+            print(f"Gutenberg search error: {e}")
+            return []
+    
+    def download_gutenberg_book(self, book_id: str) -> Optional[str]:
+        """Download a book from Project Gutenberg by ID"""
+        try:
+            # Try plain text format first (most reliable)
+            text_url = f"https://www.gutenberg.org/files/{book_id}/{book_id}-0.txt"
+            response = requests.get(text_url, headers=self.headers, timeout=30)
+            
+            if response.status_code == 200:
+                return response.text
+            
+            # Try alternative URL format
+            text_url = f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt"
+            response = requests.get(text_url, headers=self.headers, timeout=30)
+            
+            if response.status_code == 200:
+                return response.text
+            
+            # Try UTF-8 version
+            text_url = f"https://www.gutenberg.org/files/{book_id}/{book_id}-0.txt.utf8"
+            response = requests.get(text_url, headers=self.headers, timeout=30)
+            
+            if response.status_code == 200:
+                return response.text
+            
+            return None
+        except Exception as e:
+            print(f"Download error: {e}")
+            return None
+    
+    def download_epub(self, url: str) -> Optional[str]:
+        """Download and extract text from EPUB file"""
+        if not EPUB_AVAILABLE:
+            return None
+        
+        try:
+            response = requests.get(url, headers=self.headers, timeout=60, stream=True)
+            if response.status_code != 200:
+                return None
+            
+            # Save temporarily
+            temp_path = Path("temp_book.epub")
+            with open(temp_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Extract text from EPUB
+            book = epub.read_epub(str(temp_path))
+            text_parts = []
+            
+            for item in book.get_items():
+                if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                    content = item.get_content().decode('utf-8')
+                    soup = BeautifulSoup(content, 'html.parser')
+                    text = soup.get_text()
+                    if text.strip():
+                        text_parts.append(text)
+            
+            # Clean up
+            temp_path.unlink()
+            
+            return '\n\n'.join(text_parts)
+        except Exception as e:
+            print(f"EPUB download error: {e}")
+            if Path("temp_book.epub").exists():
+                Path("temp_book.epub").unlink()
+            return None
+    
+    def download_from_url(self, url: str) -> Optional[str]:
+        """Download book content from a URL (supports HTML, plain text, EPUB)"""
+        try:
+            # Check file extension
+            url_lower = url.lower()
+            
+            if url_lower.endswith('.epub'):
+                return self.download_epub(url)
+            
+            # Fetch the content
+            response = requests.get(url, headers=self.headers, timeout=60)
+            
+            if response.status_code != 200:
+                return None
+            
+            content_type = response.headers.get('Content-Type', '').lower()
+            
+            # Handle HTML
+            if 'html' in content_type or url_lower.endswith('.html'):
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Remove script and style
+                for script in soup(["script", "style", "nav", "header", "footer"]):
+                    script.decompose()
+                
+                # Try to find main content
+                main_content = soup.find('main') or soup.find('article') or soup.find('body')
+                if main_content:
+                    text = main_content.get_text()
+                else:
+                    text = soup.get_text()
+                
+                # Clean up text
+                lines = (line.strip() for line in text.splitlines())
+                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                text = '\n'.join(chunk for chunk in chunks if chunk and len(chunk) > 10)
+                
+                return text
+            
+            # Handle plain text
+            elif 'text/plain' in content_type or url_lower.endswith('.txt'):
+                return response.text
+            
+            # Default: try to parse as HTML
+            else:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                for script in soup(["script", "style"]):
+                    script.decompose()
+                return soup.get_text()
+                
+        except Exception as e:
+            print(f"URL download error: {e}")
+            return None
+    
+    def clean_book_text(self, text: str) -> str:
+        """Clean and normalize book text"""
+        if not text:
+            return ""
+        
+        # Remove Project Gutenberg headers/footers
+        # Remove text between START OF THE PROJECT GUTENBERG and END OF THE PROJECT GUTENBERG
+        text = re.sub(r'START OF THE PROJECT GUTENBERG.*?END OF THE PROJECT GUTENBERG', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Remove common Gutenberg metadata
+        text = re.sub(r'Produced by.*?\n', '', text, flags=re.DOTALL)
+        text = re.sub(r'End of the Project Gutenberg.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Clean up excessive whitespace
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' {3,}', ' ', text)
+        
+        return text.strip()
+
+
+class JarvisAssistant:
+    """Main Jarvis-like AI Assistant"""
+    def __init__(self, api_key: str = None, knowledge_base_path: str = "./jarvis_data"):
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            print("\n" + "=" * 47)
+            print("API KEY REQUIRED")
+            print("=" * 47)
+            print("Please set your Anthropic API key:")
+            print("  Option 1: Set environment variable")
+            print("    Windows: set ANTHROPIC_API_KEY=your_key")
+            print("    PowerShell: $env:ANTHROPIC_API_KEY='your_key'")
+            print("\n  Option 2: Enter it now (won't be saved):")
+            api_key_input = input("Enter your Anthropic API key: ").strip()
+            if api_key_input:
+                self.api_key = api_key_input
+            else:
+                raise ValueError("API key is required to use the assistant")
+        
+        self.client = anthropic.Anthropic(api_key=self.api_key)
+        self.knowledge_base_path = Path(knowledge_base_path)
+        self.knowledge_base_path.mkdir(exist_ok=True)
+        
+        # Initialize components (ChromaDB is optional)
+        self.chromadb_available = CHROMADB_AVAILABLE
+        if CHROMADB_AVAILABLE:
+            self.chroma_client = chromadb.PersistentClient(path=str(self.knowledge_base_path / "chroma"))
+            self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name="all-MiniLM-L6-v2"
+            )
+            self.collection = self.chroma_client.get_or_create_collection(
+                name="knowledge",
+                embedding_function=self.embedding_fn
+            )
+        else:
+            self.chroma_client = None
+            self.embedding_fn = None
+            self.collection = None
+            # Store books in simple text files as fallback
+            self.books_storage = self.knowledge_base_path / "books"
+            self.books_storage.mkdir(exist_ok=True)
+        
+        self.task_manager = TaskManager(self.knowledge_base_path)
+        self.personal_context = PersonalContext(self.knowledge_base_path)
+        self.voice = VoiceInterface()
+        self.web_search = WebSearch()
+        self.book_reader = BookReader()
+        
+        self.conversation_history = []
+        self.voice_mode = False
+    
+    def ingest_text(self, text: str, source: str, chunk_size: int = 1000):
+        """Break down text into chunks and store in vector database or file"""
+        if self.chromadb_available and self.collection:
+            chunks = []
+            for i in range(0, len(text), chunk_size):
+                chunk = text[i:i + chunk_size]
+                chunks.append({
+                    "text": chunk,
+                    "source": source,
+                    "chunk_id": f"{source}_{i}_{datetime.now().timestamp()}"
+                })
+            
+            self.collection.add(
+                documents=[c["text"] for c in chunks],
+                metadatas=[{"source": c["source"]} for c in chunks],
+                ids=[c["chunk_id"] for c in chunks]
+            )
+            
+            message = f"✓ Ingested {len(chunks)} chunks from {source} (vector DB)"
+        else:
+            # Fallback: store as text file
+            safe_source = re.sub(r'[^\w\s-]', '', source).strip()
+            file_path = self.books_storage / f"{safe_source}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(f"Source: {source}\n")
+                f.write(f"Date: {datetime.now().isoformat()}\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(text)
+            message = f"✓ Stored {len(text):,} characters from {source} (text file)"
+        
+        print(message)
+        if self.voice_mode:
+            self.voice.speak(f"Learned from {source}")
+        return message
+    
+    def ingest_pdf(self, pdf_path: str):
+        """Extract text from PDF and ingest it"""
+        pdf_path = Path(pdf_path)
+        if not pdf_path.exists():
+            return f"Error: {pdf_path} not found"
+        
+        text = ""
+        with open(pdf_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+        
+        return self.ingest_text(text, pdf_path.name)
+    
+    def ingest_image(self, image_path: str):
+        """Process image and extract information using Claude's vision"""
+        image_path = Path(image_path)
+        if not image_path.exists():
+            return f"Error: {image_path} not found"
+        
+        # Read and encode image
+        with open(image_path, 'rb') as f:
+            image_data = base64.standard_b64encode(f.read()).decode('utf-8')
+        
+        # Determine media type
+        media_type = f"image/{image_path.suffix[1:]}"
+        if image_path.suffix.lower() == '.jpg':
+            media_type = "image/jpeg"
+        
+        # Ask Claude to describe the image
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_data
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "Describe this image in detail. Extract any text, diagrams, concepts, or important information."
+                    }
+                ]
+            }]
+        )
+        
+        description = response.content[0].text
+        
+        # Store the description in knowledge base
+        self.ingest_text(description, f"image_{image_path.name}")
+        
+        return f"✓ Processed image: {image_path.name}"
+    
+    def ingest_file(self, file_path: str):
+        """Ingest various file types"""
+        file_path = Path(file_path)
+        
+        if file_path.suffix.lower() == '.pdf':
+            return self.ingest_pdf(str(file_path))
+        elif file_path.suffix.lower() in ['.txt', '.md']:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            return self.ingest_text(text, file_path.name)
+        elif file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
+            return self.ingest_image(str(file_path))
+        else:
+            return f"Unsupported file type: {file_path.suffix}"
+    
+    def read_book_from_url(self, url: str, book_title: str = None) -> str:
+        """Download and ingest a book from a URL"""
+        print(f"📚 Downloading book from {url}...")
+        text = self.book_reader.download_from_url(url)
+        
+        if not text:
+            return f"❌ Failed to download book from {url}"
+        
+        # Clean the text
+        text = self.book_reader.clean_book_text(text)
+        
+        if len(text) < 100:
+            return f"❌ Book content too short or invalid"
+        
+        # Use provided title or extract from URL
+        title = book_title or url.split('/')[-1].replace('.txt', '').replace('.epub', '').replace('.html', '')
+        
+        # Ingest the book
+        result = self.ingest_text(text, f"book_{title}")
+        
+        return f"✓ {result}\nBook: {title}\nLength: {len(text):,} characters"
+    
+    def search_and_read_book(self, query: str, book_index: int = 0) -> str:
+        """Search for a book on Project Gutenberg and read it"""
+        print(f"🔍 Searching Project Gutenberg for: {query}...")
+        results = self.book_reader.search_gutenberg(query, max_results=5)
+        
+        if not results:
+            return f"❌ No books found for '{query}'"
+        
+        # Display results
+        print("\n📚 Found books:")
+        for i, book in enumerate(results):
+            print(f"  [{i}] {book['title']} by {book['author']}")
+        
+        # Select book
+        if book_index >= len(results):
+            book_index = 0
+        
+        selected_book = results[book_index]
+        print(f"\n📖 Downloading: {selected_book['title']}...")
+        
+        if not selected_book['gutenberg_id']:
+            return f"❌ Could not find book ID for {selected_book['title']}"
+        
+        # Download the book
+        text = self.book_reader.download_gutenberg_book(selected_book['gutenberg_id'])
+        
+        if not text:
+            return f"❌ Failed to download {selected_book['title']}"
+        
+        # Clean the text
+        text = self.book_reader.clean_book_text(text)
+        
+        if len(text) < 100:
+            return f"❌ Book content too short or invalid"
+        
+        # Ingest the book
+        book_source = f"book_{selected_book['title']}_{selected_book['author']}"
+        result = self.ingest_text(text, book_source)
+        
+        return f"✓ {result}\nBook: {selected_book['title']} by {selected_book['author']}\nLength: {len(text):,} characters"
+    
+    def search_knowledge(self, query: str, n_results: int = 5) -> List[Dict]:
+        """Search your knowledge base for relevant information"""
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=n_results
+        )
+        
+        if not results['documents'][0]:
+            return []
+        
+        return [
+            {
+                "text": doc,
+                "source": meta["source"]
+            }
+            for doc, meta in zip(results['documents'][0], results['metadatas'][0])
+        ]
+    
+    def think_with_me(self, query: str, mode: str = "collaborative", use_web: bool = False):
+        """
+        Main thinking interface with all capabilities
+        """
+        
+        # Search knowledge base for relevant context
+        relevant_docs = self.search_knowledge(query, n_results=3)
+        
+        # Build context
+        context = ""
+        
+        # Add knowledge base context
+        if relevant_docs:
+            context += "\n=== KNOWLEDGE BASE ===\n"
+            for i, doc in enumerate(relevant_docs, 1):
+                context += f"\n[{doc['source']}]\n{doc['text'][:500]}...\n"
+        
+        # Add web search if requested
+        if use_web:
+            web_results = self.web_search.search(query)
+            if web_results:
+                context += "\n=== WEB SEARCH RESULTS ===\n"
+                for i, result in enumerate(web_results, 1):
+                    context += f"\n[{i}] {result['title']}\n{result['snippet']}\n"
+        
+        # Add personal context
+        context += "\n" + self.personal_context.get_context_summary()
+        
+        # Add task context
+        context += "\n" + self.task_manager.get_context()
+        
+        # Define thinking modes
+        mode_prompts = {
+            "collaborative": "Work alongside the user as a thinking partner. Build on their ideas, offer perspectives, and help them develop their thoughts further.",
+            "analytical": "Break down the question systematically. Identify key components, analyze relationships, and help structure the thinking process.",
+            "creative": "Explore unconventional angles and creative possibilities. Make unexpected connections between ideas.",
+            "socratic": "Guide through thoughtful questions rather than direct answers. Help the user discover insights themselves.",
+            "executive": "Focus on actionable insights, decisions, and next steps. Help prioritize and execute."
+        }
+        
+        system_prompt = f"""You are Jarvis, a highly capable personal AI assistant.
+
+You have access to:
+- The user's personal knowledge base (books, documents, notes)
+- Their current tasks and projects
+- Their personal preferences, goals, and interests
+- Web search results when needed
+
+{mode_prompts.get(mode, mode_prompts['collaborative'])}
+
+You can help with:
+- Deep thinking and analysis
+- Task and project management
+- Learning and synthesis from their knowledge base
+- Research using web search
+- Creative problem-solving
+- Decision-making
+
+Be concise, insightful, and proactive. Suggest actions when appropriate."""
+
+        # Build conversation for API
+        messages = self.conversation_history.copy()
+        
+        user_message = query
+        if context:
+            user_message = f"{query}\n{context}"
+        
+        messages.append({
+            "role": "user",
+            "content": user_message
+        })
+        
+        # Call Claude
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            system=system_prompt,
+            messages=messages
+        )
+        
+        assistant_response = response.content[0].text
+        
+        # Update conversation history
+        self.conversation_history.append({"role": "user", "content": query})
+        self.conversation_history.append({"role": "assistant", "content": assistant_response})
+        
+        # Keep history manageable
+        if len(self.conversation_history) > 20:
+            self.conversation_history = self.conversation_history[-20:]
+        
+        # Voice output if enabled
+        if self.voice_mode:
+            self.voice.speak(assistant_response)
+        
+        return assistant_response
+    
+    def process_command(self, command: str) -> str:
+        """Process special commands"""
+        parts = command.lower().split(maxsplit=1)
+        cmd = parts[0]
+        
+        # Task management
+        if cmd == "addtask" and len(parts) > 1:
+            return self.task_manager.add_task(parts[1])
+        elif cmd == "tasks":
+            return self.task_manager.list_tasks()
+        elif cmd == "complete" and len(parts) > 1:
+            try:
+                task_id = int(parts[1])
+                return self.task_manager.complete_task(task_id)
+            except ValueError:
+                return "Usage: complete <task_id>"
+        
+        # Personal context
+        elif cmd == "addgoal" and len(parts) > 1:
+            return self.personal_context.add_goal(parts[1])
+        elif cmd == "addinterest" and len(parts) > 1:
+            return self.personal_context.add_interest(parts[1])
+        elif cmd == "setpref" and len(parts) > 1:
+            try:
+                key, value = parts[1].split('=', 1)
+                return self.personal_context.add_preference(key.strip(), value.strip())
+            except ValueError:
+                return "Usage: setpref key=value"
+        
+        # Voice
+        elif cmd == "voice":
+            status = self.voice.toggle()
+            self.voice_mode = self.voice.enabled
+            return f"Voice {status}"
+        
+        # Stats
+        elif cmd == "stats":
+            if self.chromadb_available and self.collection:
+                count = self.collection.count()
+                kb_info = f"{count} chunks (vector DB)"
+            else:
+                book_files = list(self.books_storage.glob("*.txt")) if hasattr(self, 'books_storage') else []
+                kb_info = f"{len(book_files)} books (text files)"
+            return f"\nKnowledge: {kb_info}\nTasks: {len(self.task_manager.tasks['tasks'])} total\nGoals: {len(self.personal_context.context['goals'])}"
+        
+        # Book reading
+        elif cmd == "readbook" and len(parts) > 1:
+            # Check if it's a URL or a search query
+            if parts[1].startswith('http://') or parts[1].startswith('https://'):
+                return self.read_book_from_url(parts[1])
+            else:
+                return self.search_and_read_book(parts[1])
+        
+        elif cmd == "searchbooks" and len(parts) > 1:
+            results = self.book_reader.search_gutenberg(parts[1], max_results=10)
+            if not results:
+                return f"No books found for '{parts[1]}'"
+            
+            output = "\n📚 Search Results:\n"
+            for i, book in enumerate(results):
+                output += f"  [{i}] {book['title']} by {book['author']}\n"
+            output += "\nUse: readbook <search_query> or readbook <url> to download"
+            return output
+        
+        return None
+
+
+def main():
+    """Main interface for Jarvis"""
+    print("=" * 47)
+    print("     JARVIS - Personal AI Assistant")
+    print("=" * 47 + "\n")
+    
+    assistant = JarvisAssistant()
+    
+    print("Commands:")
+    print("  ingest <file>       - Add document/image to knowledge")
+    print("  readbook <query/url> - Read book from Gutenberg or URL")
+    print("  searchbooks <query>  - Search Project Gutenberg")
+    print("  ask <question>      - Collaborative thinking")
+    print("  think <question>    - Analytical mode")
+    print("  create <question>   - Creative mode")
+    print("  socratic <question> - Socratic questioning")
+    print("  web <question>      - Use web search")
+    print("  addtask <task>      - Add a task")
+    print("  tasks               - List pending tasks")
+    print("  complete <id>       - Complete a task")
+    print("  addgoal <goal>      - Add personal goal")
+    print("  addinterest <topic> - Add interest")
+    print("  setpref key=value   - Set preference")
+    print("  voice               - Toggle voice mode")
+    print("  stats               - Show statistics")
+    print("  clear               - Clear conversation")
+    print("  quit                - Exit\n")
+    
+    while True:
+        try:
+            # Voice input if enabled
+            if assistant.voice_mode:
+                user_input = assistant.voice.listen()
+                if user_input is None:
+                    continue
+            else:
+                user_input = input("\n🗣️  > ").strip()
+            
+            if not user_input:
+                continue
+            
+            # Handle quit
+            if user_input.lower() == "quit":
+                if assistant.voice_mode:
+                    assistant.voice.speak("Goodbye!")
+                break
+            
+            # Check for special commands
+            cmd_result = assistant.process_command(user_input)
+            if cmd_result:
+                print(f"\n{cmd_result}")
+                continue
+            
+            # Parse thinking commands
+            parts = user_input.split(maxsplit=1)
+            command = parts[0].lower()
+            
+            if command == "ingest" and len(parts) > 1:
+                result = assistant.ingest_file(parts[1])
+                print(f"\n{result}")
+            
+            elif command == "readbook" and len(parts) > 1:
+                result = assistant.process_command(user_input)
+                if result:
+                    print(f"\n{result}")
+            
+            elif command == "searchbooks" and len(parts) > 1:
+                result = assistant.process_command(user_input)
+                if result:
+                    print(f"\n{result}")
+            
+            elif command == "clear":
+                assistant.conversation_history = []
+                print("✓ Conversation cleared")
+            
+            elif command in ["ask", "think", "create", "socratic", "web"]:
+                if len(parts) < 2:
+                    print(f"Usage: {command} <your question>")
+                    continue
+                
+                mode_map = {
+                    "ask": "collaborative",
+                    "think": "analytical",
+                    "create": "creative",
+                    "socratic": "socratic",
+                    "web": "collaborative"
+                }
+                
+                use_web = (command == "web")
+                response = assistant.think_with_me(parts[1], mode=mode_map[command], use_web=use_web)
+                print(f"\n🤖 Jarvis: {response}")
+            
+            else:
+                # Default to collaborative thinking
+                response = assistant.think_with_me(user_input)
+                print(f"\n🤖 Jarvis: {response}")
+        
+        except KeyboardInterrupt:
+            print("\n\nGoodbye!")
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
