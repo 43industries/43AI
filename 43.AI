@@ -44,7 +44,19 @@ try:
 except ImportError:
     CHROMADB_AVAILABLE = False
     print("Note: chromadb not available - knowledge base vector search disabled")
-    print("Books can still be downloaded and stored, but semantic search won't work")
+    print("Books can still be downloaded and stored; keyword search over text files will be used")
+
+# Thinking pipeline defaults
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+MAX_TOKENS = 2000
+MEMORY_SUMMARY_MAX_TOKENS = 500
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+SNIPPET_MAX_CHARS = 1200
+HISTORY_SOFT_LIMIT = 20
+HISTORY_KEEP_RECENT = 10
+TOOL_LOOP_MAX_ROUNDS = 5
+MAX_THINKING_PATTERNS = 20
 
 
 class TaskManager:
@@ -154,6 +166,9 @@ class PersonalContext:
             "pattern": pattern,
             "observed": datetime.now().isoformat()
         })
+        # Cap stored patterns so memory stays useful
+        if len(self.context["thinking_patterns"]) > MAX_THINKING_PATTERNS:
+            self.context["thinking_patterns"] = self.context["thinking_patterns"][-MAX_THINKING_PATTERNS:]
         self._save_context()
     
     def get_context_summary(self) -> str:
@@ -172,6 +187,12 @@ class PersonalContext:
         
         if self.context["interests"]:
             summary += f"\nInterests: {', '.join(self.context['interests'][:10])}\n"
+        
+        patterns = self.context.get("thinking_patterns") or []
+        if patterns:
+            summary += "\nRecent thinking patterns:\n"
+            for entry in patterns[-5:]:
+                summary += f"- {entry.get('pattern', entry)}\n"
         
         return summary
 
@@ -487,6 +508,9 @@ class JarvisAssistant:
         
         # Initialize components (ChromaDB is optional)
         self.chromadb_available = CHROMADB_AVAILABLE
+        # Always keep a books folder for file fallback / dual storage
+        self.books_storage = self.knowledge_base_path / "books"
+        self.books_storage.mkdir(exist_ok=True)
         if CHROMADB_AVAILABLE:
             self.chroma_client = chromadb.PersistentClient(path=str(self.knowledge_base_path / "chroma"))
             self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -500,9 +524,6 @@ class JarvisAssistant:
             self.chroma_client = None
             self.embedding_fn = None
             self.collection = None
-            # Store books in simple text files as fallback
-            self.books_storage = self.knowledge_base_path / "books"
-            self.books_storage.mkdir(exist_ok=True)
         
         self.task_manager = TaskManager(self.knowledge_base_path)
         self.personal_context = PersonalContext(self.knowledge_base_path)
@@ -510,19 +531,108 @@ class JarvisAssistant:
         self.web_search = WebSearch()
         self.book_reader = BookReader()
         
+        self.conversation_path = self.knowledge_base_path / "conversation.json"
+        self.memory_summary = ""
         self.conversation_history = []
+        self._load_conversation()
         self.voice_mode = False
+
+    def _chunk_text(self, text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+        """Split text into overlapping chunks"""
+        if chunk_size <= 0:
+            return [text] if text else []
+        overlap = min(overlap, chunk_size - 1) if chunk_size > 1 else 0
+        step = max(chunk_size - overlap, 1)
+        chunks = []
+        for i in range(0, len(text), step):
+            chunk = text[i:i + chunk_size]
+            if chunk.strip():
+                chunks.append(chunk)
+            if i + chunk_size >= len(text):
+                break
+        return chunks
+
+    def _load_conversation(self):
+        """Load persisted conversation history and memory summary"""
+        if not self.conversation_path.exists():
+            return
+        try:
+            with open(self.conversation_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.conversation_history = data.get("history", [])
+            self.memory_summary = data.get("memory_summary", "")
+        except Exception as e:
+            print(f"Could not load conversation history: {e}")
+            self.conversation_history = []
+            self.memory_summary = ""
+
+    def _save_conversation(self):
+        """Persist conversation history and memory summary"""
+        try:
+            with open(self.conversation_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "history": self.conversation_history,
+                    "memory_summary": self.memory_summary,
+                    "updated": datetime.now().isoformat()
+                }, f, indent=2)
+        except Exception as e:
+            print(f"Could not save conversation history: {e}")
+
+    def clear_conversation(self):
+        """Clear in-memory and persisted conversation"""
+        self.conversation_history = []
+        self.memory_summary = ""
+        self._save_conversation()
+        return "✓ Conversation cleared"
+
+    def _summarize_old_turns(self, turns: List[Dict]) -> str:
+        """Summarize older conversation turns into a memory note"""
+        if not turns:
+            return self.memory_summary
+        transcript = ""
+        for msg in turns:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            transcript += f"{role}: {content}\n"
+        prior = self.memory_summary.strip()
+        prompt = (
+            "Summarize the following conversation turns into a concise memory note "
+            "(key facts, preferences, decisions, open threads). Keep under 300 words.\n"
+        )
+        if prior:
+            prompt += f"\nExisting memory summary to merge with:\n{prior}\n"
+        prompt += f"\nTurns to summarize:\n{transcript}"
+        try:
+            response = self.client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=MEMORY_SUMMARY_MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.content[0].text.strip()
+        except Exception as e:
+            print(f"Memory summarize error: {e}")
+            return prior or transcript[:1000]
+
+    def _trim_and_persist_history(self):
+        """Keep history manageable; summarize older turns when over soft limit"""
+        if len(self.conversation_history) > HISTORY_SOFT_LIMIT:
+            older = self.conversation_history[:-HISTORY_KEEP_RECENT]
+            recent = self.conversation_history[-HISTORY_KEEP_RECENT:]
+            self.memory_summary = self._summarize_old_turns(older)
+            self.conversation_history = recent
+        self._save_conversation()
     
-    def ingest_text(self, text: str, source: str, chunk_size: int = 1000):
-        """Break down text into chunks and store in vector database or file"""
+    def ingest_text(self, text: str, source: str, chunk_size: int = CHUNK_SIZE):
+        """Break down text into overlapping chunks and store in vector database or file"""
         if self.chromadb_available and self.collection:
+            text_chunks = self._chunk_text(text, chunk_size=chunk_size, overlap=CHUNK_OVERLAP)
             chunks = []
-            for i in range(0, len(text), chunk_size):
-                chunk = text[i:i + chunk_size]
+            stamp = datetime.now().timestamp()
+            for i, chunk in enumerate(text_chunks):
                 chunks.append({
                     "text": chunk,
                     "source": source,
-                    "chunk_id": f"{source}_{i}_{datetime.now().timestamp()}"
+                    "chunk_id": f"{source}_{i}_{stamp}"
                 })
             
             self.collection.add(
@@ -579,7 +689,7 @@ class JarvisAssistant:
         
         # Ask Claude to describe the image
         response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=CLAUDE_MODEL,
             max_tokens=1024,
             messages=[{
                 "role": "user",
@@ -685,56 +795,164 @@ class JarvisAssistant:
         
         return f"✓ {result}\nBook: {selected_book['title']} by {selected_book['author']}\nLength: {len(text):,} characters"
     
-    def search_knowledge(self, query: str, n_results: int = 5) -> List[Dict]:
-        """Search your knowledge base for relevant information"""
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=n_results
-        )
-        
-        if not results['documents'][0]:
+    def _search_knowledge_files(self, query: str, n_results: int = 5) -> List[Dict]:
+        """Keyword search over jarvis_data/books text files"""
+        terms = [t.lower() for t in re.findall(r'\w+', query) if len(t) > 2]
+        if not terms:
+            terms = [query.lower().strip()] if query.strip() else []
+        if not terms:
             return []
-        
+
+        scored = []
+        for path in self.books_storage.glob("*.txt"):
+            try:
+                text = path.read_text(encoding='utf-8', errors='ignore')
+            except Exception:
+                continue
+            lower = text.lower()
+            score = sum(lower.count(term) for term in terms)
+            if score <= 0:
+                continue
+            # Prefer a window around the first matching term
+            first_pos = min((lower.find(term) for term in terms if term in lower), default=0)
+            start = max(0, first_pos - SNIPPET_MAX_CHARS // 4)
+            snippet = text[start:start + SNIPPET_MAX_CHARS]
+            source = path.stem
+            for line in text.splitlines()[:5]:
+                if line.lower().startswith("source:"):
+                    source = line.split(":", 1)[1].strip() or source
+                    break
+            scored.append({"text": snippet, "source": source, "score": score})
+
+        scored.sort(key=lambda d: d["score"], reverse=True)
+        return [{"text": d["text"], "source": d["source"]} for d in scored[:n_results]]
+
+    def search_knowledge(self, query: str, n_results: int = 5) -> List[Dict]:
+        """Search knowledge base (Chroma semantic search or file keyword fallback)"""
+        n_results = max(1, min(n_results, 8))
+        if self.chromadb_available and self.collection:
+            try:
+                count = self.collection.count()
+                if count == 0:
+                    return []
+                results = self.collection.query(
+                    query_texts=[query],
+                    n_results=min(n_results, count)
+                )
+                if not results.get('documents') or not results['documents'][0]:
+                    return []
+                return [
+                    {
+                        "text": doc[:SNIPPET_MAX_CHARS],
+                        "source": meta.get("source", "unknown")
+                    }
+                    for doc, meta in zip(results['documents'][0], results['metadatas'][0])
+                ]
+            except Exception as e:
+                print(f"Vector search error, falling back to files: {e}")
+                return self._search_knowledge_files(query, n_results=n_results)
+        return self._search_knowledge_files(query, n_results=n_results)
+
+    def _tool_definitions(self) -> List[Dict]:
         return [
             {
-                "text": doc,
-                "source": meta["source"]
+                "name": "search_knowledge",
+                "description": "Search the user's personal knowledge base (books, documents, notes) for relevant passages.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "n_results": {"type": "integer", "description": "Number of results (1-8)", "default": 5}
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "web_search",
+                "description": "Search the live web for current information. Returns titles, URLs, and snippets.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Web search query"},
+                        "num_results": {"type": "integer", "description": "Number of results", "default": 3}
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "fetch_url",
+                "description": "Fetch and extract text content from a webpage URL.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Full URL to fetch"}
+                    },
+                    "required": ["url"]
+                }
+            },
+            {
+                "name": "list_tasks",
+                "description": "List the user's pending tasks and project context.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
             }
-            for doc, meta in zip(results['documents'][0], results['metadatas'][0])
         ]
-    
-    def think_with_me(self, query: str, mode: str = "collaborative", use_web: bool = False):
-        """
-        Main thinking interface with all capabilities
-        """
-        
-        # Search knowledge base for relevant context
-        relevant_docs = self.search_knowledge(query, n_results=3)
-        
-        # Build context
-        context = ""
-        
-        # Add knowledge base context
-        if relevant_docs:
-            context += "\n=== KNOWLEDGE BASE ===\n"
-            for i, doc in enumerate(relevant_docs, 1):
-                context += f"\n[{doc['source']}]\n{doc['text'][:500]}...\n"
-        
-        # Add web search if requested
-        if use_web:
-            web_results = self.web_search.search(query)
-            if web_results:
-                context += "\n=== WEB SEARCH RESULTS ===\n"
-                for i, result in enumerate(web_results, 1):
-                    context += f"\n[{i}] {result['title']}\n{result['snippet']}\n"
-        
-        # Add personal context
-        context += "\n" + self.personal_context.get_context_summary()
-        
-        # Add task context
-        context += "\n" + self.task_manager.get_context()
-        
-        # Define thinking modes
+
+    def _execute_tool(self, name: str, tool_input: Dict) -> str:
+        """Run a tool and return a string result for Claude"""
+        try:
+            if name == "search_knowledge":
+                docs = self.search_knowledge(
+                    tool_input.get("query", ""),
+                    n_results=int(tool_input.get("n_results", 5))
+                )
+                if not docs:
+                    return "No matching knowledge found."
+                parts = []
+                for i, doc in enumerate(docs, 1):
+                    parts.append(f"[{i}] source={doc['source']}\n{doc['text']}")
+                return "\n\n".join(parts)
+
+            if name == "web_search":
+                results = self.web_search.search(
+                    tool_input.get("query", ""),
+                    num_results=int(tool_input.get("num_results", 3))
+                )
+                if not results:
+                    return "No web results found."
+                parts = []
+                for i, r in enumerate(results, 1):
+                    parts.append(f"[{i}] {r['title']}\nURL: {r['url']}\n{r['snippet']}")
+                return "\n\n".join(parts)
+
+            if name == "fetch_url":
+                text = self.web_search.fetch_page(tool_input.get("url", ""))
+                return text or "Failed to fetch page or page was empty."
+
+            if name == "list_tasks":
+                return self.task_manager.list_tasks() + "\n" + self.task_manager.get_context()
+
+            return f"Unknown tool: {name}"
+        except Exception as e:
+            return f"Tool error ({name}): {e}"
+
+    def _maybe_learn_from_query(self, query: str):
+        """Light auto-learn when the user message looks preference/goal-like"""
+        lower = query.lower()
+        cues = (
+            "i prefer", "i like", "i want", "my goal", "i'm trying", "i am trying",
+            "remember that", "always", "never", "i need", "please remember"
+        )
+        if any(c in lower for c in cues):
+            note = query.strip()
+            if len(note) > 200:
+                note = note[:200] + "..."
+            self.personal_context.learn_pattern(f"User said: {note}")
+
+    def _build_system_prompt(self, mode: str, use_web: bool = False) -> str:
         mode_prompts = {
             "collaborative": "Work alongside the user as a thinking partner. Build on their ideas, offer perspectives, and help them develop their thoughts further.",
             "analytical": "Break down the question systematically. Identify key components, analyze relationships, and help structure the thinking process.",
@@ -742,61 +960,92 @@ class JarvisAssistant:
             "socratic": "Guide through thoughtful questions rather than direct answers. Help the user discover insights themselves.",
             "executive": "Focus on actionable insights, decisions, and next steps. Help prioritize and execute."
         }
-        
-        system_prompt = f"""You are Jarvis, a highly capable personal AI assistant.
+        web_hint = ""
+        if use_web:
+            web_hint = (
+                "\nThe user requested web-backed research. Prefer calling web_search first "
+                "(and fetch_url for promising links) before answering.\n"
+            )
+        memory_block = ""
+        if self.memory_summary:
+            memory_block = f"\n=== CONVERSATION MEMORY ===\n{self.memory_summary}\n"
 
-You have access to:
-- The user's personal knowledge base (books, documents, notes)
-- Their current tasks and projects
-- Their personal preferences, goals, and interests
-- Web search results when needed
+        return f"""You are Jarvis, a highly capable personal AI assistant for this user.
 
+Mode instruction:
 {mode_prompts.get(mode, mode_prompts['collaborative'])}
+{web_hint}
+You have tools: search_knowledge, web_search, fetch_url, list_tasks.
+Use them when you need books/docs, live web info, page content, or task lists. Do not invent knowledge-base or web facts—call tools instead.
+Be concise, insightful, and proactive. Cite sources when you used tools. Suggest actions when appropriate.
 
-You can help with:
-- Deep thinking and analysis
-- Task and project management
-- Learning and synthesis from their knowledge base
-- Research using web search
-- Creative problem-solving
-- Decision-making
+{self.personal_context.get_context_summary()}
 
-Be concise, insightful, and proactive. Suggest actions when appropriate."""
+=== TASK CONTEXT ===
+{self.task_manager.get_context()}
+{memory_block}"""
 
-        # Build conversation for API
-        messages = self.conversation_history.copy()
-        
-        user_message = query
-        if context:
-            user_message = f"{query}\n{context}"
-        
-        messages.append({
-            "role": "user",
-            "content": user_message
-        })
-        
-        # Call Claude
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            system=system_prompt,
-            messages=messages
-        )
-        
-        assistant_response = response.content[0].text
-        
-        # Update conversation history
+    def think_with_me(self, query: str, mode: str = "collaborative", use_web: bool = False):
+        """
+        Main thinking interface with tool-use loop, system context, and persisted memory
+        """
+        system_prompt = self._build_system_prompt(mode, use_web=use_web)
+
+        messages = [m.copy() for m in self.conversation_history]
+        messages.append({"role": "user", "content": query})
+
+        tools = self._tool_definitions()
+        assistant_response = ""
+
+        for _ in range(TOOL_LOOP_MAX_ROUNDS):
+            response = self.client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                tools=tools,
+                messages=messages
+            )
+
+            if response.stop_reason == "tool_use":
+                # Append assistant content (may include text + tool_use blocks)
+                messages.append({"role": "assistant", "content": response.content})
+                tool_results = []
+                for block in response.content:
+                    if getattr(block, "type", None) == "tool_use":
+                        result_text = self._execute_tool(block.name, block.input or {})
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_text
+                        })
+                messages.append({"role": "user", "content": tool_results})
+                continue
+
+            # Final text response
+            text_parts = [
+                block.text for block in response.content
+                if getattr(block, "type", None) == "text"
+            ]
+            assistant_response = "\n".join(text_parts).strip()
+            break
+        else:
+            # Hit round limit; try to extract any text from last response
+            text_parts = [
+                block.text for block in response.content
+                if getattr(block, "type", None) == "text"
+            ]
+            assistant_response = "\n".join(text_parts).strip() or (
+                "I reached the tool-use limit before finishing. Please try a narrower question."
+            )
+
         self.conversation_history.append({"role": "user", "content": query})
         self.conversation_history.append({"role": "assistant", "content": assistant_response})
-        
-        # Keep history manageable
-        if len(self.conversation_history) > 20:
-            self.conversation_history = self.conversation_history[-20:]
-        
-        # Voice output if enabled
+        self._maybe_learn_from_query(query)
+        self._trim_and_persist_history()
+
         if self.voice_mode:
             self.voice.speak(assistant_response)
-        
+
         return assistant_response
     
     def process_command(self, command: str) -> str:
@@ -840,9 +1089,15 @@ Be concise, insightful, and proactive. Suggest actions when appropriate."""
                 count = self.collection.count()
                 kb_info = f"{count} chunks (vector DB)"
             else:
-                book_files = list(self.books_storage.glob("*.txt")) if hasattr(self, 'books_storage') else []
+                book_files = list(self.books_storage.glob("*.txt"))
                 kb_info = f"{len(book_files)} books (text files)"
-            return f"\nKnowledge: {kb_info}\nTasks: {len(self.task_manager.tasks['tasks'])} total\nGoals: {len(self.personal_context.context['goals'])}"
+            return (
+                f"\nKnowledge: {kb_info}\n"
+                f"Tasks: {len(self.task_manager.tasks['tasks'])} total\n"
+                f"Goals: {len(self.personal_context.context['goals'])}\n"
+                f"Conversation turns: {len(self.conversation_history)}"
+                + (f"\nMemory summary: yes" if self.memory_summary else "")
+            )
         
         # Book reading
         elif cmd == "readbook" and len(parts) > 1:
@@ -938,8 +1193,7 @@ def main():
                     print(f"\n{result}")
             
             elif command == "clear":
-                assistant.conversation_history = []
-                print("✓ Conversation cleared")
+                print(assistant.clear_conversation())
             
             elif command in ["ask", "think", "create", "socratic", "web"]:
                 if len(parts) < 2:

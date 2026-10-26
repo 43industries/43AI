@@ -99,6 +99,11 @@ Your **43.AI** is a comprehensive Jarvis-like personal assistant with advanced c
 - **Knowledge Base**: `./jarvis_data/chroma/` (vector DB) or `./jarvis_data/books/` (text files)
 - **Tasks**: `./jarvis_data/tasks.json`
 - **Personal Context**: `./jarvis_data/personal_context.json`
+- **Conversation memory**: `./jarvis_data/conversation.json` (persists across restarts; older turns are summarized)
+
+**ChromaDB** is recommended for semantic search over books and documents. Without it, the assistant still works and uses keyword search over `jarvis_data/books/`. Install with: `py -m pip install --user chromadb`
+
+Thinking uses an on-demand tool loop (`search_knowledge`, `web_search`, `fetch_url`, `list_tasks`) instead of dumping all context into every prompt.
 
 ---
 

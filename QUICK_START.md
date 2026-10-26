@@ -79,6 +79,8 @@ voice
 3. **Multiple thinking modes** - Use `think` for analysis, `create` for ideas
 4. **Task integration** - AI knows your tasks and can help prioritize
 5. **Personal context** - Set preferences and goals for personalized help
+6. **Conversation persists** - History lives in `jarvis_data/conversation.json` across restarts (`clear` wipes it)
+7. **Install ChromaDB** for better book/doc search: `py -m pip install --user chromadb`
 
 ---
 
